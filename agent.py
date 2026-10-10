@@ -1,7 +1,7 @@
 import subprocess
 from typing import TypedDict, List
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 
 class AgentState(TypedDict):
@@ -13,11 +13,12 @@ class AgentState(TypedDict):
     attempt_count: int
     status: str
     logs: List[str]
+    gemini_api_key: str
 
 def run_sandbox_eval(test_path: str) -> tuple[int, str]:
     try:
         proc = subprocess.run(
-            ["python", test_path],
+            ["py", test_path],
             capture_output=True,
             text=True,
             timeout=10
@@ -50,27 +51,71 @@ def generate_patch(state: AgentState) -> dict:
     attempt = state["attempt_count"] + 1
     new_logs.append(f"🛠️ Patch Engine: Running self-correction attempt #{attempt}...")
     
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+    candidate_models = [
+        'gemini-3.8-flash',
+        'gemini-3-flash',
+        'gemini-3.8-pro',
+        'gemini-3.5-flash-lite',
+        'gemini-flash-latest'
+    ]
     
     prompt = f"""
-    Incident Report: {state['incident_report']}
+Incident Report: {state['incident_report']}
+
+Current File Content:
+{state['code_content']}
+
+Runtime Failure / Traceback:
+{state['test_output']}
+
+Fix the bug. Output ONLY valid, executable Python code for the target file.
+Do not wrap inside markdown codeblocks (no ```python). Return raw code only.
+"""
     
-    Current File Content:
-    {state['code_content']}
+    res = None
+    used_model = None
+    last_err = None
     
-    Runtime Failure / Traceback:
-    {state['test_output']}
-    
-    Fix the bug. Output ONLY the raw replacement python code for the target file.
-    Do not wrap inside markdown ticks (```python). Return only executable code.
-    """
-    
-    res = llm.invoke([
-        SystemMessage(content="You are an autonomous SRE patch agent. Return raw code only."),
-        HumanMessage(prompt)
-    ])
-    
-    clean_code = res.content.replace("```python", "").replace("```", "").strip()
+    for model_name in candidate_models:
+        try:
+            llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=state.get("gemini_api_key"),
+                temperature=0.1
+            )
+            res = llm.invoke([
+                SystemMessage(content="You are an autonomous SRE patch agent. Return raw code only."),
+                HumanMessage(content=prompt)
+            ])
+            if res and res.content:
+                used_model = model_name
+                break
+        except Exception as err:
+            last_err = err
+            continue
+            
+    if not res:
+        raise last_err or Exception("All configured Gemini models failed.")
+        
+    new_logs.append(f"🤖 Patch generated via `{used_model}`")
+
+    # Handles string or multipart list returned by Gemini safely
+    if isinstance(res.content, list):
+        parts = []
+        for p in res.content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif hasattr(p, 'text'):
+                parts.append(str(p.text))
+            elif isinstance(p, dict) and 'text' in p:
+                parts.append(str(p['text']))
+            else:
+                parts.append(str(p))
+        raw_text = "".join(parts)
+    else:
+        raw_text = str(res.content)
+
+    clean_code = raw_text.replace("```python", "").replace("```", "").strip()
     
     with open(state["target_file"], "w", encoding="utf-8") as f:
         f.write(clean_code)
@@ -82,7 +127,7 @@ def generate_patch(state: AgentState) -> dict:
         new_logs.append(f"✅ Sandbox validation successful on attempt #{attempt}!")
         new_status = "passed"
     else:
-        last_line = output.strip().splitlines()[-1] if output.strip() else "Unknown error"
+        last_line = output.strip().splitlines()[-1] if output.strip() else "Assertion Error"
         new_logs.append(f"⚠️ Patch failed assertions. Stderr: {last_line}")
         new_status = "failing"
         
